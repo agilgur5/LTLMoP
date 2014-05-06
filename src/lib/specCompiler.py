@@ -41,10 +41,6 @@ class SpecCompiler(object):
         Load the project object
         """
         self.proj.loadProject(spec_filename)
-        self.hsub = handlerSubsystem.HandlerSubsystem(None, self.proj.project_root)
-        config, success = self.hsub.loadConfigFile(self.proj.current_config)
-        if success: self.hsub.configs.append(config)
-        self.hsub.setExecutingConfig(self.proj.current_config)
 
         # Check to make sure this project is complete
         if self.proj.rfi is None:
@@ -169,6 +165,11 @@ class SpecCompiler(object):
             if self.proj.current_config == "":
                 region_tags = {}
             else:
+                self.hsub = handlerSubsystem.HandlerSubsystem(None, self.proj.project_root)
+                config, success = self.hsub.loadConfigFile(self.proj.current_config)
+                if success: self.hsub.configs.append(config)
+                self.hsub.setExecutingConfig(self.proj.current_config)
+
                 region_tags = self.hsub.executing_config.region_tags
 
             # Hack: We need to make sure there's only one of these
@@ -490,20 +491,31 @@ class SpecCompiler(object):
                     logging.warning(err_message)
                     err = 1
 
-    def _getGROneCommand(self, module):
-        # Check that GROneMain, etc. is compiled
-        if not os.path.exists(os.path.join(self.proj.ltlmop_root,"etc","jtlv","GROne","GROneMain.class")):
-            logging.error("Please compile the synthesis Java code first.  For instructions, see etc/jtlv/JTLV_INSTRUCTIONS.")
+    def _getSlugsCommand(self):
+        slugs_path = os.path.join(self.proj.ltlmop_root, "etc", "slugs", "src", "slugs")
+
+        # Check that slugs is compiled
+        if not os.path.exists(slugs_path):
             # TODO: automatically compile for the user
-            return None
+            raise RuntimeError("Please compile the synthesis code first.  For instructions, see etc/slugs/README.md.")
+
+        cmd = [slugs_path, "--sysInitRoboticsSemantics", self.proj.getFilenamePrefix() + ".slugsin", self.proj.getFilenamePrefix() + ".aut"]
+
+        return cmd
+
+    def _getGROneCommand(self, module):
+        jtlv_path = os.path.join(self.proj.ltlmop_root, "etc", "jtlv")
+
+        # Check that GROneMain, etc. is compiled
+        if not os.path.exists(os.path.join(jtlv_path, "GROne", "GROneMain.class")):
+            # TODO: automatically compile for the user
+            raise RuntimeError("The Java synthesis code does not appear to be compiled yet.  Please run dist/setup.py before using LTLMoP.")
 
         # Windows uses a different delimiter for the java classpath
-        if os.name == "nt":
-            delim = ";"
-        else:
-            delim = ":"
+        delim = ";" if os.name == "nt" else ":"
 
-        classpath = delim.join([os.path.join(self.proj.ltlmop_root, "etc", "jtlv", "jtlv-prompt1.4.0.jar"), os.path.join(self.proj.ltlmop_root, "etc", "jtlv", "GROne")])
+        classpath = delim.join([os.path.join(jtlv_path, "jtlv-prompt1.4.0.jar"),
+                                os.path.join(jtlv_path, "GROne")])
 
         cmd = ["java", "-ea", "-Xmx512m", "-cp", classpath, module, self.proj.getFilenamePrefix() + ".smv", self.proj.getFilenamePrefix() + ".ltl"]
 
@@ -535,6 +547,9 @@ class SpecCompiler(object):
         return nonTrivial
 
     def _analyze(self):
+        if self.proj.compile_options["synthesizer"].lower() != "jtlv":
+            raise RuntimeError("Analysis is currently only supported when using JTLV.")
+
         cmd = self._getGROneCommand("GROneDebug")
         if cmd is None:
             return (False, False, [], "")
@@ -833,6 +848,25 @@ class SpecCompiler(object):
 
         return (self.realizable, self.realizableFS, log_string.getvalue())
 
+    def prepareSlugsInput(self):
+        """ Convert from JTLV input format (.smv+.ltl) to Slugs input format (.slugsin)
+            using the script provided by Slugs.
+
+            This is a stop-gap fix; eventually we should just produce the input
+            directly instead of using the conversion script. """
+
+        # Add the conversion script to our path
+        slugs_converter_path = os.path.join(self.proj.ltlmop_root, "etc", "slugs", "tools")
+        sys.path.insert(0, slugs_converter_path)
+        from translateFromLTLMopLTLFormatToSlugsFormat import performConversion
+
+        # Call the conversion script
+        with open(self.proj.getFilenamePrefix() + ".slugsin", "w") as f:
+            # TODO: update performConversion so we don't have to do stdout redirection
+            sys.stdout = f
+            performConversion(self.proj.getFilenamePrefix() + ".smv", self.proj.getFilenamePrefix() + ".ltl")
+            sys.stdout = sys.__stdout__
+
     def _synthesizeAsync(self, log_function=None, completion_callback_function=None):
         """ Asynchronously call the synthesis tool.  This function will return immediately after
             spawning a subprocess.  `log_function` will be called with a string argument every time
@@ -840,17 +874,35 @@ class SpecCompiler(object):
             when synthesis finishes, with two arguments: the success flags `realizable`
             and `realizableFS`. """
 
-        # Find the synthesis tool
-        cmd = self._getGROneCommand("GROneMain")
-        if cmd is None:
-            # No tool available
-            return (False, False, "")
+        if self.proj.compile_options["synthesizer"].lower() == "jtlv":
+            # Find the synthesis tool
+            cmd = self._getGROneCommand("GROneMain")
 
-        # Add any extra compiler options
-        if self.proj.compile_options["fastslow"]:
-            cmd.append("--fastslow")
-        if self.proj.compile_options["symbolic"]:
-            cmd.append("--symbolic")
+            # Add any extra compiler options
+            if self.proj.compile_options["fastslow"]:
+                cmd.append("--fastslow")
+            if self.proj.compile_options["symbolic"]:
+                cmd.append("--symbolic")
+
+            REALIZABLE_MESSAGE = "Specification is synthesizable!"
+            REALIZABLE_FS_MESSAGE = "Specification is synthesizable under fast/slow!"
+
+        elif self.proj.compile_options["synthesizer"].lower() == "slugs":
+            # Find the synthesis tool
+            cmd = self._getSlugsCommand()
+
+            # Make sure flags are compatible
+            if any(self.proj.compile_options[k] for k in ("fastslow", "symbolic")):
+                raise RuntimeError("Slugs does not currently support fast/slow or symbolic compilation options.")
+
+            # Create proper input for Slugs
+            logging.info("Preparing Slugs input...")
+            self.prepareSlugsInput()
+
+            REALIZABLE_MESSAGE = "RESULT: Specification is realizable"
+            REALIZABLE_FS_MESSAGE = None
+        else:
+            raise RuntimeError("Invalid synthesizer: {!r}".format(self.proj.compile_options["synthesizer"]))
 
         self.realizable = False
         self.realizableFS = False
@@ -860,9 +912,9 @@ class SpecCompiler(object):
         def onLog(text):
             """ Intercept log callbacks to check for realizability status. """
 
-            if "Specification is synthesizable!" in text:
+            if REALIZABLE_MESSAGE in text:
                 self.realizable = True
-            if "Specification is synthesizable under fast/slow!" in text:
+            if REALIZABLE_FS_MESSAGE is not None and REALIZABLE_FS_MESSAGE in text:
                 self.realizableFS = True
 
             # You'll pass this on, won't you
@@ -879,6 +931,8 @@ class SpecCompiler(object):
             self.synthesis_subprocess = None
 
         # Kick off the subprocess
+        logging.info("Synthesizing a strategy...")
+
         self.synthesis_subprocess = AsynchronousProcessThread(cmd, onSubprocessComplete, onLog)
 
     def abortSynthesis(self):
@@ -904,7 +958,6 @@ class SpecCompiler(object):
             return
 
         #self._checkForEmptyGaits()
-        logging.info("Synthesizing a strategy...")
 
         return self._synthesize()
 

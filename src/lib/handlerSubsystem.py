@@ -57,9 +57,6 @@ class HandlerSubsystem:
     Interface dealing with configuration files and handlers
     """
 
-    # Set the pattern for regex to match the functions in proposition mapping
-    handler_function_RE = r"(?P<robot_name>\w+)\.(?P<handler_name>\w+)\.(?P<method_name>\w+)\((?P<para_info>.*?)\)"
-
     def __init__(self, executor, project_root_dir):
         self.executor = executor
 
@@ -163,7 +160,7 @@ class HandlerSubsystem:
             # if the h_type is a handler type class object, translate it into a str
             if h_type is None:
                 h_type =  self.findHandlerTypeStringFromName(h_name)
-            if not isinstance(h_type, str):
+            if not isinstance(h_type, basestring):
                 h_type = ht.getHandlerTypeName(h_type)
             handler_module = '.'.join(['lib', 'handlers', r_type, h_type, h_name])
         else:
@@ -171,7 +168,11 @@ class HandlerSubsystem:
             handler_module = '.'.join(['lib', 'handlers', r_type, h_name])
 
         try:
-            handler_config.loadHandlerMethod(handler_module)
+            if h_type in ("Sensor", "Actuator"):
+                handler_config.loadHandlerMethod(handler_module)
+            else:
+                handler_config.loadHandlerMethod(handler_module, onlyLoadInit=True)
+
             handler_config.robot_type = r_type
         except ImportError as import_error:
             # TODO: Log an error here if the handler is necessary
@@ -396,6 +397,30 @@ class HandlerSubsystem:
 
         return pose_handler_instance.getPose(cached)
 
+    def getDefaultPropMapping(self, sensor_prop_list, actuator_prop_list):
+        """
+        Return the default proposition mapping based on the propositions given
+        """
+
+        # we need handler configs to create the default proposition mapping
+        if self.handler_configs == {}:
+            raise ValueError("Cannot get default proposition mapping. Please load all handlers first.")
+
+        prop_mapping = {}
+        for p in sensor_prop_list:
+            m = deepcopy(self.handler_configs["share"][ht.SensorHandler][0].getMethodByName("buttonPress"))
+            para = m.getParaByName("button_name")
+            para.setValue(p)
+            prop_mapping[p] = self.method2String(m, "share")
+
+        for p in actuator_prop_list:
+            m = deepcopy(self.handler_configs["share"][ht.ActuatorHandler][0].getMethodByName("setActuator"))
+            para = m.getParaByName("name")
+            para.setValue(p)
+            prop_mapping[p] = self.method2String(m, "share")
+
+        return prop_mapping
+
 
     def initializeAllMethods(self):
         """
@@ -407,7 +432,12 @@ class HandlerSubsystem:
         # since we cannot distinguish the method for sensor and actuator
         # we will pass in arguments for both types of methods
         for method_config in self.method_configs:
-            method_config.execute(initial=True, actuatorVal=False)
+            if method_config.handler.h_type is ht.SensorHandler:
+                method_config.execute(initial=True)
+            elif method_config.handler.h_type is ht.ActuatorHandler:
+                method_config.execute(initial=True, actuatorVal=False)
+            else:
+                raise TypeError("Handler mappings must contain only Sensor or Actuator handlers")
 
     def prepareHandler(self, handler_config):
         """
@@ -433,10 +463,18 @@ class HandlerSubsystem:
             # find the handler class object
             h_name, h_type, handler_class = HandlerConfig.loadHandlerClass(handler_module_path)
 
-            # construct the arguments list
-            arg_dict = {"executor":self.executor, "shared_data":self.executor.proj.shared_data}
-            init_method = handler_config.getMethodByName("__init__")
-            arg_dict = self.prepareArguments(init_method, arg_dict)
+            # get the HMC for the init_method
+            init_method_config = handler_config.getMethodByName("__init__")
+
+            # construct the arguments list; everyone gets a reference to executor
+            arg_dict = {"executor": self.executor}
+
+            # everyone except for InitHandler gets shared_data too
+            if h_type is not ht.InitHandler:
+                arg_dict.update({"shared_data":self.executor.proj.shared_data})
+
+            # add any arguments specific to this method
+            arg_dict.update(init_method_config.getArgDict())
 
             # instantiate the handler
             try:
@@ -446,30 +484,6 @@ class HandlerSubsystem:
             else:
                 self.handler_instance.append(h)
         return h
-
-    def prepareArguments(self, method_config, arg_dict={}):
-        """
-        Prepare a dictionary {arg_name:arg_value} based on the method_config given.
-        Extra argment setting can be given with the arg_dict
-
-        return a dictionary that holds the argument name and value
-        """
-
-        # construct the arguments list
-        # starts with LTLMoP internal arguments
-        output_arg_dict = {}
-
-        for para_config in method_config.para:
-            if para_config.name in arg_dict:
-                output_arg_dict[para_config.name] = arg_dict[para_config.name]
-            else:
-                output_arg_dict[para_config.name] = para_config.getValue()
-
-        for para_name in method_config.omit_para:
-            if para_name in arg_dict:
-                output_arg_dict[para_name] = arg_dict[para_name]
-
-        return output_arg_dict
 
     def prepareMapping(self):
         """
@@ -595,26 +609,21 @@ class HandlerSubsystem:
             logging.error("Cannot find handler_configs dictionary, please load all handlers first.")
             return None
 
-        # construct regex for identify each parts
-        method_RE = re.compile(HandlerSubsystem.handler_function_RE)
-
-        result = method_RE.search(method_string)
-
-        if not result:
-            logging.error("Cannot parse setting {!r}".format(method_string))
+        try:
+            call_descriptors, _ = parseCallString(method_string, mode="single")
+            if len(call_descriptors[0].name) != 3:
+                raise SyntaxError("Name must be in form of '<robot_name>.<handler_name>.<method_name>'")
+        except SyntaxError:
+            logging.exception("Cannot parse setting {!r}".format(method_string))
             return None
 
-        # parse each part
-        robot_name = result.group("robot_name")
-        handler_name = result.group("handler_name")
-        method_name = result.group("method_name")
-        para_info = result.group("para_info")
+        robot_name, handler_name, method_name = call_descriptors[0].name
 
         # find which handler does this method belongs to
         handler_config = None
 
         if robot_name == "share":
-            # this ia a dummy sensor/actuator
+            # this is a dummy sensor/actuator
             for h in self.handler_configs["share"][ht.SensorHandler] + \
                      self.handler_configs["share"][ht.ActuatorHandler]:
                 if h.name == handler_name:
@@ -640,7 +649,7 @@ class HandlerSubsystem:
             return None
 
         # update parameters of this method
-        method_config.updateParaFromString(para_info)
+        method_config.updateParaFromDict(call_descriptors[0].args)
 
         return method_config
 
@@ -652,9 +661,11 @@ class HandlerSubsystem:
         if not self.handler_configs:
             logging.error("Cannot find handler dictionary, please load all handler first.")
             return
+
         if not isinstance(method_config,HandlerMethodConfig):
             logging.error("Input is not a valid method config.")
             return
+
         if robot_name=='':
             logging.error("Needs robot name for method2String")
             return
@@ -663,19 +674,10 @@ class HandlerSubsystem:
         method_name = method_config.name
 
         # convert all parameter object into string
-        para_list = []
-        for para_config in method_config.para:
-            if para_config.value is None:
-                para_list.append( para_config.name+'='+str(para_config.default))
-            else:
-                if para_config.para_type.lower() in ['str', 'string', 'region']:
-                    para_list.append( para_config.name+'=\"'+str(para_config.value)+'\"')
-                else:
-                    para_list.append( para_config.name+'='+str(para_config.value))
+        para_info = ', '.join("{}={!r}".format(k, v)
+                              for k, v in method_config.getArgDict().iteritems())
 
-        para_info = ','.join(para_list)
-
-        return '.'.join([robot_name,handler_name,method_name])+'('+para_info+')'
+        return '.'.join([robot_name, handler_name, method_name])+'('+para_info+')'
 
     def getSensorValue(self, prop_name_list):
         """

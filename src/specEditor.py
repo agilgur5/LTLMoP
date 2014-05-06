@@ -29,7 +29,7 @@ sys.path.append(os.path.join(p,"lib","cores"))
 
 from regions import *
 import project
-import fsa
+import strategy
 import mapRenderer
 from specCompiler import SpecCompiler
 from asyncProcesses import AsynchronousProcessThread
@@ -174,7 +174,7 @@ class AnalysisResultsDialog(wx.Dialog):
         self.text_ctrl_summary.WriteText(text)
         self.text_ctrl_summary.EndTextColour()
         self.text_ctrl_summary.ShowPosition(self.text_ctrl_summary.GetLastPosition())
-        wx.Yield() # Ensure update
+        wx.GetApp().Yield(True) # Ensure update
                 
     def onButtonClose(self, event): # wxGlade: AnalysisResultsDialog.<event_handler>
         self.Hide()
@@ -267,6 +267,10 @@ class SpecEditorFrame(wx.Frame):
         global MENU_PARSERMODE_SLURP; MENU_PARSERMODE_SLURP = wx.NewId()
         global MENU_PARSERMODE_STRUCTURED; MENU_PARSERMODE_STRUCTURED = wx.NewId()
         global MENU_PARSERMODE_LTL; MENU_PARSERMODE_LTL = wx.NewId()
+        global MENU_SYNTHESIZER; MENU_SYNTHESIZER = wx.NewId()
+        global MENU_SYNTHESIZER_JTLV; MENU_SYNTHESIZER_JTLV = wx.NewId()
+        global MENU_SYNTHESIZER_SLUGS; MENU_SYNTHESIZER_SLUGS = wx.NewId()
+        global MENU_SYMBOLIC; MENU_SYMBOLIC = wx.NewId()
         global MENU_SIMULATE; MENU_SIMULATE = wx.NewId()
         global MENU_SIMCONFIG; MENU_SIMCONFIG = wx.NewId()
         global MENU_ANALYZE; MENU_ANALYZE = wx.NewId()
@@ -300,6 +304,11 @@ class SpecEditorFrame(wx.Frame):
         wxglade_tmp_menu_sub_sub.Append(MENU_PARSERMODE_STRUCTURED, "Structured English", "", wx.ITEM_RADIO)
         wxglade_tmp_menu_sub_sub.Append(MENU_PARSERMODE_LTL, "LTL", "", wx.ITEM_RADIO)
         wxglade_tmp_menu_sub.AppendMenu(MENU_PARSERMODE, "Parser mode", wxglade_tmp_menu_sub_sub, "")
+        wxglade_tmp_menu_sub_sub = wx.Menu()
+        wxglade_tmp_menu_sub_sub.Append(MENU_SYNTHESIZER_JTLV, "JTLV", "", wx.ITEM_RADIO)
+        wxglade_tmp_menu_sub_sub.Append(MENU_SYNTHESIZER_SLUGS, "Slugs", "", wx.ITEM_RADIO)
+        wxglade_tmp_menu_sub.AppendMenu(MENU_SYNTHESIZER, "Synthesizer", wxglade_tmp_menu_sub_sub, "")
+        wxglade_tmp_menu_sub.Append(MENU_SYMBOLIC, "Use symbolic strategy", "", wx.ITEM_CHECK)
         wxglade_tmp_menu.AppendMenu(MENU_COMPILECONFIG, "Compilation options", wxglade_tmp_menu_sub, "")
         wxglade_tmp_menu.AppendSeparator()
         wxglade_tmp_menu.Append(MENU_SIMULATE, "&Simulate\tF6", "", wx.ITEM_NORMAL)
@@ -369,6 +378,9 @@ class SpecEditorFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.onMenuSetCompileOptions, id=MENU_PARSERMODE_SLURP)
         self.Bind(wx.EVT_MENU, self.onMenuSetCompileOptions, id=MENU_PARSERMODE_STRUCTURED)
         self.Bind(wx.EVT_MENU, self.onMenuSetCompileOptions, id=MENU_PARSERMODE_LTL)
+        self.Bind(wx.EVT_MENU, self.onMenuSetCompileOptions, id=MENU_SYNTHESIZER_JTLV)
+        self.Bind(wx.EVT_MENU, self.onMenuSetCompileOptions, id=MENU_SYNTHESIZER_SLUGS)
+        self.Bind(wx.EVT_MENU, self.onMenuSetCompileOptions, id=MENU_SYMBOLIC)
         self.Bind(wx.EVT_MENU, self.onMenuSimulate, id=MENU_SIMULATE)
         self.Bind(wx.EVT_MENU, self.onMenuConfigSim, id=MENU_SIMCONFIG)
         self.Bind(wx.EVT_MENU, self.onMenuAnalyze, id=MENU_ANALYZE)
@@ -491,15 +503,9 @@ class SpecEditorFrame(wx.Frame):
         self.text_ctrl_spec.MarkerDeleteAll(MARKER_SAFE)
         self.text_ctrl_spec.MarkerDeleteAll(MARKER_LIVE)
         self.text_ctrl_log.Clear()
-        self.frame_1_menubar.Check(MENU_CONVEXIFY, self.proj.compile_options["convexify"])
-        self.frame_1_menubar.Check(MENU_BITVECTOR, self.proj.compile_options["use_region_bit_encoding"])
-        self.frame_1_menubar.Check(MENU_FASTSLOW, self.proj.compile_options["fastslow"])
-        if self.proj.compile_options["parser"] == "slurp":
-            self.frame_1_menubar.Check(MENU_PARSERMODE_SLURP, True)
-        elif self.proj.compile_options["parser"] == "structured":
-            self.frame_1_menubar.Check(MENU_PARSERMODE_STRUCTURED, True)
-        elif self.proj.compile_options["parser"] == "ltl":
-            self.frame_1_menubar.Check(MENU_PARSERMODE_LTL, True)
+
+        # Set options menu status based on proj options
+        self.updateMenusFromProjectOptions()
 
         self.SetTitle("Specification Editor - Untitled")
 
@@ -898,9 +904,15 @@ class SpecEditorFrame(wx.Frame):
         self.text_ctrl_spec.EmptyUndoBuffer()
 
         # Set compilation option checkboxes
-        self.frame_1_menubar.Check(MENU_BITVECTOR, self.proj.compile_options["use_region_bit_encoding"])
+        self.updateMenusFromProjectOptions()
+
+        self.dirty = False
+
+    def updateMenusFromProjectOptions(self):
         self.frame_1_menubar.Check(MENU_CONVEXIFY, self.proj.compile_options["convexify"])
+        self.frame_1_menubar.Check(MENU_BITVECTOR, self.proj.compile_options["use_region_bit_encoding"])
         self.frame_1_menubar.Check(MENU_FASTSLOW, self.proj.compile_options["fastslow"])
+        self.frame_1_menubar.Check(MENU_SYMBOLIC, self.proj.compile_options["symbolic"])
 
         if self.proj.compile_options["parser"] == "slurp":
             self.frame_1_menubar.Check(MENU_PARSERMODE_SLURP, True)
@@ -908,8 +920,11 @@ class SpecEditorFrame(wx.Frame):
             self.frame_1_menubar.Check(MENU_PARSERMODE_STRUCTURED, True)
         elif self.proj.compile_options["parser"] == "ltl":
             self.frame_1_menubar.Check(MENU_PARSERMODE_LTL, True)
-    
-        self.dirty = False
+
+        if self.proj.compile_options["synthesizer"] == "jtlv":
+            self.frame_1_menubar.Check(MENU_SYNTHESIZER_JTLV, True)
+        elif self.proj.compile_options["synthesizer"] == "slugs":
+            self.frame_1_menubar.Check(MENU_SYNTHESIZER_SLUGS, True)
 
     def doClose(self, event): # wxGlade: SpecEditorFrame.<event_handler>
         """
@@ -1090,7 +1105,13 @@ class SpecEditorFrame(wx.Frame):
             wx.CallAfter(self.appendLog, "\t"+text)
 
         # Kick off the synthesis
-        compiler._synthesizeAsync(onLog)
+        try:
+            compiler._synthesizeAsync(onLog)
+        except RuntimeError as e:
+            wx.MessageBox(e.message, "Error",
+                        style = wx.OK | wx.ICON_ERROR)
+            busy_dialog.Destroy()
+            return
 
         while not compiler.synthesis_complete.isSet():
             # Keep the progress bar spinning and check if the Abort button has been pressed
@@ -1103,7 +1124,7 @@ class SpecEditorFrame(wx.Frame):
             # Let wx and the OS have some time
             # We are updating here instead of in the log callback because log output
             # may be very infrequent
-            wx.Yield()
+            wx.GetApp().Yield(True)
             time.sleep(0.1)
 
         # Done! Close the dialog.
@@ -1141,7 +1162,7 @@ class SpecEditorFrame(wx.Frame):
         #self.text_ctrl_log.EndBold()
         self.text_ctrl_log.EndTextColour()
         self.text_ctrl_log.ShowPosition(self.text_ctrl_log.GetLastPosition())
-        wx.Yield() # Ensure update
+        wx.GetApp().Yield(True) # Ensure update
 
     def onMenuSimulate(self, event): # wxGlade: SpecEditorFrame.<event_handler>
         """ Run the simulation with current experiment configuration. """
@@ -1280,18 +1301,13 @@ class SpecEditorFrame(wx.Frame):
         self.subprocess["Simulation Configuration"] = WxAsynchronousProcessThread([sys.executable, "-u", "-m", "lib.configEditor", self.proj.getFilenamePrefix()+".spec"], simConfigCallback, None)
 
     def _exportDotFile(self):
-        proj_copy = deepcopy(self.proj)
-        proj_copy.rfi = self.decomposedRFI
-        proj_copy.sensor_handler = None
-        proj_copy.actuator_handler = None
-        proj_copy.h_instance = None
+        region_domain = strategy.Domain("region",  self.decomposedRFI.regions, strategy.Domain.B0_IS_MSB)
+        strat = strategy.createStrategyFromFile(self.proj.getStrategyFilename(),
+                                                self.proj.enabled_sensors,
+                                                self.proj.enabled_actuators + self.proj.all_customs +  [region_domain])
 
-        aut = fsa.Automaton(proj_copy)
-
-        aut.loadFile(self.proj.getFilenamePrefix()+".aut", self.proj.enabled_sensors, self.proj.enabled_actuators, self.proj.all_customs)
-        aut.writeDot(self.proj.getFilenamePrefix()+".dot")
-        
-        
+        strat.exportAsDotFile(self.proj.getFilenamePrefix()+".dot") 
+      
     def _exportSMVFile(self):              
         aut.writeSMV(self.proj.getFilenamePrefix()+"MC.smv")
         
@@ -1378,9 +1394,16 @@ class SpecEditorFrame(wx.Frame):
         redir = RedirectText(self, self.text_ctrl_log)
         sys.stdout = redir
         sys.stderr = redir
-        (realizable, self.unsat, nonTrivial, self.to_highlight, output) = self.compiler._analyze()
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
+
+        try:
+            (realizable, self.unsat, nonTrivial, self.to_highlight, output) = self.compiler._analyze()
+        except RuntimeError as e:
+            wx.MessageBox(e.message, "Error",
+                        style = wx.OK | wx.ICON_ERROR)
+            return
+        finally:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
 
         # Remove lines about garbage collection from the output and remove extraenous lines
         output_lines = [line for line in output.split('\n') if line.strip() and
@@ -1626,12 +1649,20 @@ class SpecEditorFrame(wx.Frame):
         self.proj.compile_options["convexify"] = self.frame_1_menubar.IsChecked(MENU_CONVEXIFY)
         self.proj.compile_options["fastslow"] = self.frame_1_menubar.IsChecked(MENU_FASTSLOW)
         self.proj.compile_options["use_region_bit_encoding"] = self.frame_1_menubar.IsChecked(MENU_BITVECTOR)
+        self.proj.compile_options["symbolic"] = self.frame_1_menubar.IsChecked(MENU_SYMBOLIC)
+
         if self.frame_1_menubar.IsChecked(MENU_PARSERMODE_SLURP):
             self.proj.compile_options["parser"] = "slurp"
         elif self.frame_1_menubar.IsChecked(MENU_PARSERMODE_STRUCTURED):
             self.proj.compile_options["parser"] = "structured"
         elif self.frame_1_menubar.IsChecked(MENU_PARSERMODE_LTL):
             self.proj.compile_options["parser"] = "ltl"
+
+        if self.frame_1_menubar.IsChecked(MENU_SYNTHESIZER_JTLV):
+            self.proj.compile_options["synthesizer"] = "jtlv"
+        elif self.frame_1_menubar.IsChecked(MENU_SYNTHESIZER_SLUGS):
+            self.proj.compile_options["synthesizer"] = "slugs"
+
         self.dirty = True
 
     def onRegionLabelStyleChange(self, event):  # wxGlade: SpecEditorFrame.<event_handler>

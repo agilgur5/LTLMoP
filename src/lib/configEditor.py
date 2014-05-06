@@ -18,15 +18,15 @@ sys.path.append(os.path.join(p,"src","lib"))
 
 import project
 from copy import deepcopy
-from handlerSubsystem import *
 from numpy import *
 import subprocess
 import socket
 
 import handlerSubsystem
+from hsubParsingUtils import parseCallString
 import lib.handlers.handlerTemplates as ht
 import lib.globalConfig
-from lib.hsubConfigObjects import ExperimentConfig
+from lib.hsubConfigObjects import ExperimentConfig, RobotConfig
 # begin wxGlade: extracode
 # end wxGlade
 
@@ -121,16 +121,8 @@ def drawParamConfigPane(target, method, proj):
             # Ignore; from another control (e.g. calib matrix)
             return
 
-        if this_param.para_type.lower() == "region":
-            this_param.setValue(param_controls[this_param].GetValue())
-        elif this_param.para_type.lower().startswith("bool"):
-            this_param.setValue(str(param_controls[this_param].GetValue()))
-        elif this_param.para_type.lower().startswith("int"):
-            this_param.setValue(str(param_controls[this_param].GetValue()))
-        else:
-            this_param.setValue(param_controls[this_param].GetValue())
+        this_param.setValue(param_controls[this_param].GetValue())
 
-        #print this_param.name, this_param.value
     target.Bind(wx.EVT_TEXT, paramPaneCallback)
     target.Bind(wx.EVT_COMBOBOX, paramPaneCallback)
     target.Bind(wx.EVT_CHECKBOX, paramPaneCallback)
@@ -302,6 +294,7 @@ class handlerConfigDialog(wx.Dialog):
         self.Bind(wx.EVT_BUTTON, self.onClickDefaults, self.button_defaults)
         # end wxGlade
 
+        self.hsub = parent.hsub
         self.proj = parent.proj
         self.robot = parent.robot
 
@@ -330,7 +323,7 @@ class handlerConfigDialog(wx.Dialog):
     def _onCalibEdit(self, event):
         r = event.GetRow()
         c = event.GetCol()
-        self.robot.calibrationMatrix[r,c] = self.sheet.GetCellValue(r,c)
+        self.robot.calibration_matrix[r,c] = self.sheet.GetCellValue(r,c)
         event.Skip()
 
     def _onClickCalibrate(self, event):
@@ -397,7 +390,7 @@ class handlerConfigDialog(wx.Dialog):
                 wx.Yield()
             else:
                 try:
-                    self.robot.calibrationMatrix = eval(data)
+                    self.robot.calibration_matrix = eval(data)
                 except SyntaxError:
                     print "ERROR: Received invalid data from calibration tool."
                 else:
@@ -423,10 +416,10 @@ class handlerConfigDialog(wx.Dialog):
         drawParamConfigPane(self.panel_configs, methodObj, self.proj)
 
         # Add in calibration configuration pane for pose handler
-        if handler.h_type == "pose":
+        if handler.h_type is ht.PoseHandler:
             # Default to identity matrix
-            if self.robot.calibrationMatrix is None:
-                self.robot.calibrationMatrix = eye(3)
+            if self.robot.calibration_matrix is None:
+                self.robot.calibration_matrix = eye(3)
 
             label = wx.StaticText(self.panel_configs, -1, "Calibration Matrix:")
             self.sheet = wx.grid.Grid(self.panel_configs)
@@ -436,7 +429,7 @@ class handlerConfigDialog(wx.Dialog):
             for x in range(0,3):
                 self.sheet.SetColFormatFloat(x)
                 for y in range(0,3):
-                    self.sheet.SetCellValue(x, y, str(self.robot.calibrationMatrix[x,y]))
+                    self.sheet.SetCellValue(x, y, str(self.robot.calibration_matrix[x,y]))
 
             button_calibrate = wx.Button(self.panel_configs, -1, "Run calibration tool...")
 
@@ -447,7 +440,7 @@ class handlerConfigDialog(wx.Dialog):
             self.Bind(wx.EVT_BUTTON, self._onClickCalibrate, button_calibrate)
 
             # If this robot has a pre-defined calibration matrix, don't allow for calibration
-            if self.hsub.getRobotByType(self.robot.r_type).calibrationMatrix is not None:
+            if self.hsub.getRobotByType(self.robot.r_type).calibration_matrix is not None:
                 button_calibrate.SetLabel("Calibration is pre-defined by simulator.")
                 button_calibrate.Enable(False)
 
@@ -533,11 +526,6 @@ class simSetupDialog(wx.Dialog):
         self.proj.loadProject(sys.argv[1])
         self.hsub = handlerSubsystem.HandlerSubsystem(None, self.proj.project_root)
 
-        # Create configs/ directory for project if it doesn't exist already
-#        config_dir = os.path.join(self.proj.project_root, "configs")
-#        if not os.path.exists(config_dir):
-#            os.mkdir(config_dir)
-
         # Set up the list of configs
         self.list_box_experiment_name.Clear()
         print "Loading handlers..."
@@ -559,7 +547,7 @@ class simSetupDialog(wx.Dialog):
             cfg = ExperimentConfig()
             # TODO: Check for existing untitleds and add a number at the end (steal from reged)
             cfg.name = "Untitled configuration"
-            cfg.fileName = os.path.join(self.hsub.config_path,cfg.name.replace(' ','_'))
+            cfg.file_name = os.path.join(self.hsub.config_path,cfg.name.replace(' ','_'))
             # since this config is not loaded, we assume it is complete
             self.hsub.configs.append(cfg)
             self.list_box_experiment_name.Append(cfg.name, cfg)
@@ -861,6 +849,7 @@ class simSetupDialog(wx.Dialog):
         dlg.Destroy()
         event.Skip()
 
+
     def onClickApply(self, event): # wxGlade: simSetupDialog.<event_handler>
 
         # Get the current experiment config
@@ -884,6 +873,10 @@ class simSetupDialog(wx.Dialog):
             d.ShowModal()
             event.Skip(False)
             return
+
+        # clean up prop_mapping of the current executing config
+        default_prop_mapping = self.hsub.getDefaultPropMapping(self.proj.all_sensors, self.proj.all_actuators)
+        self.hsub.executing_config.normalizePropMapping(default_prop_mapping)
 
         # Save the config files
         self.hsub.saveAllConfigFiles()
@@ -972,6 +965,7 @@ class addRobotDialog(wx.Dialog):
         # end wxGlade
 
         self.parent = parent
+        self.hsub = parent.hsub
         self.proj = parent.proj
         self.robot = RobotConfig()
         self.original_robot = RobotConfig()
@@ -1000,7 +994,7 @@ class addRobotDialog(wx.Dialog):
         self.combo_box_robottype.Clear()
 
         for r in self.parent.hsub.robot_configs:
-            self.combo_box_robottype.Append(r.r_type + r.successfully_loaded)
+            self.combo_box_robottype.Append(r.r_type + (" (Not successfully loaded)" if not self.robot.successfully_loaded else ""))
 
     def _populateHandlerCombos(self):
         # Populate based on current robot type
@@ -1061,7 +1055,7 @@ class addRobotDialog(wx.Dialog):
         self.robot = robot
         if original:
             self.original_robot = deepcopy(robot)
-        self.combo_box_robottype.SetStringSelection(self.robot.r_type + self.robot.successfully_loaded)
+        self.combo_box_robottype.SetStringSelection(self.robot.r_type + (" (Not successfully loaded)" if not self.robot.successfully_loaded else ""))
         self.text_ctrl_robotname.SetValue(self.robot.name)
         self._populateHandlerCombos()
 
@@ -1168,7 +1162,7 @@ class addRobotDialog(wx.Dialog):
         for h_type, handler in self.robot.handlers.iteritems():
             for param in handler.getMethodByName("__init__").para:
                 if param.getValue() is None:
-                    incomplete_params.append((handler[0].name, param.name))
+                    incomplete_params.append((handler.name, param.name))
 
         if len(incomplete_params) > 0:
             wx.MessageBox("The following parameters need to be specified:\n" + \
@@ -1456,6 +1450,10 @@ class propMappingDialog(wx.Dialog):
 
         s = self.text_ctrl_mapping.GetValue()
 
+        # Don't bother going any further if it's blank
+        if s.strip() == "":
+            return
+
         start, end = self.text_ctrl_mapping.GetSelection()
         if start >= 0:
             # If something is selected, check to make sure neither side is inside a methodstring
@@ -1464,21 +1462,28 @@ class propMappingDialog(wx.Dialog):
             # Otherwise just make sure the insertion point hasn't moved inside a methodstring
             check_pts = [i]
 
-        p = re.compile(HandlerSubsystem.handler_function_RE)
-        m_local = None
+        try:
+            cds, _ = parseCallString(s, mode="sensor")  # Sensor mode is more lenient than actuator
+        except SyntaxError:
+            # If there was a parsing error, it's not a proper methodstring anyways
+            return
 
-        for m in p.finditer(s):
-            if any([i > m.start() and i < m.end() for i in check_pts]):
-                m_local = m
+        cd_local = None
+
+        for cd in cds:
+            if any([i > cd.start_pos and i < cd.end_pos for i in check_pts]):
+                cd_local = cd
                 break
 
-        if m_local is None:
+        if cd_local is None:
             return
-        else:
-            m = m_local
+
+        # Make sure the name is the correct length
+        if len(cd_local.name) != 3:
+            return
 
         # Make sure the robot name is valid
-        rname = m.group("robot_name")
+        rname = cd_local.name[0]
         if rname == "share":
             rname = "(Simulated)"
         corresponding_robots = [n for n in self.list_box_robots.GetItems() if n.startswith(rname)]
@@ -1488,22 +1493,21 @@ class propMappingDialog(wx.Dialog):
             return
 
         # Force selection of the entire keyword, and place insertion caret as appropriate
-        self.text_ctrl_mapping.SetSelection(m.start(),m.end())
+        self.text_ctrl_mapping.SetSelection(cd_local.start_pos, cd_local.end_pos)
 
         if event is not None:
             if event.GetEventType() in [wx.wxEVT_KEY_DOWN, wx.wxEVT_KEY_UP]:
                 if event.GetKeyCode() in [wx.WXK_LEFT, wx.WXK_HOME, wx.WXK_UP, wx.WXK_NUMPAD_LEFT, wx.WXK_NUMPAD_UP]:
-                    self.text_ctrl_mapping.MoveCaret(m.start()-1)
+                    self.text_ctrl_mapping.MoveCaret(cd_local.start_pos-1)
                 elif event.GetKeyCode() in [wx.WXK_RIGHT, wx.WXK_END, wx.WXK_DOWN, wx.WXK_NUMPAD_RIGHT, wx.WXK_NUMPAD_DOWN]:
-                    self.text_ctrl_mapping.MoveCaret(m.end()-1)
+                    self.text_ctrl_mapping.MoveCaret(cd_local.end_pos-1)
 
         # Load detailed view of keyword below
         self.list_box_robots.SetStringSelection(corresponding_robots[0])
         self.onSelectRobot(None)
-        self.list_box_functions.SetStringSelection(m.group("method_name"))
+        self.list_box_functions.SetStringSelection(cd_local.name[2])
 
-        #print "matched: ", m.group()
-        self.tempMethod = self.hsub.string2Method(m.group(), self.robots)
+        self.tempMethod = self.hsub.string2Method(s[cd_local.start_pos:cd_local.end_pos], self.robots)
         drawParamConfigPane(self.panel_method_cfg, self.tempMethod, self.proj)
         self.Layout()
 

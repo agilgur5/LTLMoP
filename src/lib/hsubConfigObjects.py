@@ -13,7 +13,7 @@
 import os, sys, re
 import fileMethods
 import inspect, types
-from numpy import linalg, array, finfo, mat
+from numpy import linalg, array, finfo, mat, eye
 from copy import deepcopy
 import ast
 import json
@@ -21,6 +21,7 @@ import traceback
 import globalConfig, logging
 import importlib
 import handlers.handlerTemplates as ht
+from hsubParsingUtils import parseCallString
 
 
 ###################################################
@@ -32,6 +33,51 @@ class MethodParameterConfig(object):
     Contains name, description, type, value, and default as determined
     by performing introspection on the individual handler modules
     """
+
+    @classmethod
+    def fromString(cls, para_string):
+        """
+        Create a MethodParameterConfig from a single line of a comment from a
+        handler method.
+
+        para_string: string specifying the properties of the parameter
+        """
+
+        # Regular expression to help us out
+        # NOTE: The description does not permit parentheses
+        argRE = re.compile('^\s*(?P<argName>\w+)\s*\(\s*(?P<type>\w+)\s*\)\s*:\s*(?P<description>[^\(]+)\s*(?P<settings>\(.+\))?\s*$', re.IGNORECASE)
+
+        # Try to match
+        m = argRE.search(para_string)
+
+        if m is None:
+            raise ValueError("Not a properly-formatted parameter description.")
+
+        new_obj = cls(name=m.group('argName'),
+                      para_type=m.group('type'),
+                      desc=m.group('description'))
+
+        if m.group('settings') is not None:
+            # To make valid Python syntax, we just need to prepend
+            # a dummy function name before the settings string
+            try:
+                call_desc, _ = parseCallString("dummy_function"+m.group("settings"),
+                                               mode="single")
+            except SyntaxError as e:
+                raise SyntaxError("Error while parsing settings for parameter {!r}: {}".format(m.group('argName'), e))
+
+            settings = call_desc[0].args
+
+            # Set all of the settings
+            for k, v in settings.iteritems():
+                if k.lower() not in ['default', 'min_val', 'max_val', 'options', 'min', 'max']:
+                    raise SyntaxError("Unrecognized setting name {!r} for parameter {!r}".format(k.lower(), m.group('argName')))
+
+                setattr(new_obj, k.lower(), v)
+
+        new_obj.resetValue()
+
+        return new_obj
 
     def __init__(self, name="", para_type="", desc="", default=None, max_val=None, min_val=None, value=None):
         self.name = name                # name of the parameter
@@ -60,46 +106,17 @@ class MethodParameterConfig(object):
         This function makes sure all parameter are set according to the desired type
         """
 
-        # Change None para_type to empty string to avoid None.lower()
-        if self.para_type == None: self.para_type = ""
+        valid_types = dict([(k, float) for k in ('float', 'double', 'choice')] +
+                           [(k, int) for k in ('integer', 'int', 'choice')] +
+                           [(k, bool) for k in ('bool', 'boolean', 'choice')] +
+                           [(k, basestring) for k in ('region', 'str', 'string', 'choice')] +
+                           [(k, list) for k in ('multichoice',)])
 
-        if self.para_type.lower() in ['float', 'double']:
-            try:
-                self.value = float(value)
-            except ValueError:
-                logging.error("Invalid float value: {0} for parameter {1}".format(value, self.name))
-        elif self.para_type.lower() in ['int', 'integer']:
-            try:
-                self.value = int(value)
-            except ValueError:
-                logging.error("Invalid int value: {0} for parameter {1}".format(value, self.name))
-        elif self.para_type.lower() == 'bool' or self.para_type.lower() == 'boolean':
-            if str(value).lower() in ['1', 'true', 't']:
-                self.value = True
-            elif str(value).lower() in ['0', 'false', 'f']:
-                self.value = False
-        elif self.para_type.lower() == 'region':
-            try:
-                self.value = value.strip("'\"")
-            except ValueError:
-                logging.error("Invalid region value: {0} for parameter {1}".format(value, self.name))
-        elif self.para_type.lower() in ['str', 'string']:
-            try:
-                self.value = str(value).strip('\"\'')
-            except ValueError:
-                logging.error("Invalid string value: {0} for parameter {1}".format(value, self.name))
-        elif self.para_type.lower() == 'choice':
-            try:
-                self.value = ast.literal_eval(value)
-            except ValueError:
-                logging.error("Invalid choice value: {0} for parameter {1}".format(value, self.name))
-        elif self.para_type.lower() == 'multichoice':
-            try:
-                self.value = ast.literal_eval(value)
-            except ValueError:
-                logging.error("Invalid multichoice value: {0} for parameter {1}".format(value, self.name))
-        else:
-            logging.error("Cannot set the value of parameter {0}, because its type {1} cannot be recognized.".format(self.name, self.para_type))
+        if not isinstance(value, valid_types[self.para_type.lower()]):
+            raise ValueError("Invalid {} value: {!r} for parameter {!r}".format(self.para_type, value, self.name))
+            return
+
+        self.value = value
 
     def getValue(self):
         return self.value
@@ -111,42 +128,6 @@ class MethodParameterConfig(object):
             self.value = None
         else:
             self.setValue(self.default)
-
-    def fromString(self, para_string, method_config):
-        """
-        Create a MethodParameterConfig from a line of comments in the method object
-
-        para_string : a line of comments in the method object specifies the properties of the parameter
-        method_config: a HandlerMethodConfig object where the parameter exists
-        """
-        # Regular expressions to help us out
-        argRE = re.compile('(?P<argName>\w+)(\s*\((?P<type>\w+)\s*\))(\s*:\s*)(?P<description>[^\(]+)(\s*\((?P<range>.+)\s*\))?', re.IGNORECASE)
-        settingRE = re.compile(r"""(?x)
-                                   (?P<key>\w+)
-                                   \s*=\s*
-                                   (?P<val>
-                                       "[^"]*" | # double-quoted string
-                                       \[[^\]]*\] | # array
-                                       [^,\s]*    # other
-                                    )""")
-
-        # update the parameter object
-        m = argRE.search(para_string)
-        self.para_type = m.group('type')
-        self.desc = m.group('description')
-        if m.group('range') is not None:
-            try:
-                for k, v in settingRE.findall(m.group('range')):
-                    if k.lower() not in ['default', 'min_val', 'max_val', 'options', 'min', 'max']:
-                        logging.warning('Unrecognized setting name "{0}" for parameter "{1}" of method "{2}"'.format(k.lower(), m.group('argName'), method_config.name))
-                        continue
-
-                    setattr(self, k.lower(), json.loads(v.lower()))
-            except ValueError:
-                # LOG AN ERROR HERE
-                logging.warning('Could not parse settings for parameter "{0}" of method "{1}"'.format(m.group('argName'), method_config.name))
-
-            self.resetValue()
 
 
 class HandlerMethodConfig(object):
@@ -162,10 +143,9 @@ class HandlerMethodConfig(object):
         self.omit_para = omit_para  # list of parameter names that are omitted
         self.method_reference = None # a reference to this method
 
-        # To avoid recursive setting
         if self.para is None:
             self.para = []
-        # To avoid recursive setting
+
         if self.omit_para is None:
             self.omit_para = []
 
@@ -193,24 +173,10 @@ class HandlerMethodConfig(object):
 
     def getParaByName(self, name):
         # get the parameter object with given name
-        for p in self.para:
-            if p.name == name:
-                return p
-        logging.error("Could not find parameter of name '{0}' in method '{1}'".format(name, self.name))
-        return None
-
-    def updateParaFromString(self, para_str):
-        """
-        update all parameter config object of this method config object with info from given string
-        """
-        # if the input string has parentheses around it
-        para_str = para_str.strip('\(\)')
-
-        # parse the string and set the value accordingly
-        for para_name, para_value in re.findall(r'(?P<key>\w+)\s*=\s*(?P<val>"[^"]*"|\'[^\']*\'|[^,]+)', para_str):
-            para_value = para_value.strip("\"\'")
-            para_config = self.getParaByName(para_name)
-            para_config.setValue(para_value)
+        try:
+            return next(p for p in self.para if p.name == name)
+        except StopIteration:
+            raise ValueError("Could not find parameter of name '{0}' in method '{1}'".format(name, self.name))
 
     def updateParaFromDict(self, para_dict):
         """
@@ -221,6 +187,15 @@ class HandlerMethodConfig(object):
             para_config = self.getParaByName(para_name)
             para_config.setValue(para_value)
 
+    def getArgDict(self):
+        """
+        Prepare a dictionary {arg_name:arg_value} based on the method_config.
+
+        return a dictionary that holds the argument name and value
+        """
+
+        return {p.name: p.getValue() for p in self.para}
+
     def execute(self, **extra_args):
         """
         call the reference of this method with stored parameter values
@@ -229,22 +204,13 @@ class HandlerMethodConfig(object):
         if self.method_reference is None:
             raise ValueError("No reference of method {} is set.".format(self.name))
 
-        # construct the arguments list
-        # starts with LTLMoP internal arguments
-        arg_dict = {}
+        # Get the args we store internally
+        arg_dict = self.getArgDict()
 
-        for para_config in self.para:
-            if para_config.name in extra_args:
-                arg_dict[para_config.name] = extra_args[para_config.name]
-            else:
-                arg_dict[para_config.name] = para_config.getValue()
-
-        for para_name in self.omit_para:
-            if para_name in extra_args:
-                arg_dict[para_name] = extra_args[para_name]
+        # Add any extra args
+        arg_dict.update(extra_args)
 
         return self.method_reference(**arg_dict)
-
 
     def fromMethod(self, method, handler_config):
         """
@@ -253,20 +219,9 @@ class HandlerMethodConfig(object):
         method: python method object
         handler_config: instance of HandlerConfig where this HandlerMethodConfig locates
         """
-        # Regular expressions to help us out
-        argRE = re.compile('(?P<argName>\w+)(\s*\((?P<type>\w+)\s*\))(\s*:\s*)(?P<description>[^\(]+)(\s*\((?P<range>.+)\s*\))?', re.IGNORECASE)
 
         self.name = method.__name__
         self.handler = handler_config
-
-        # parsing parameters of the method
-        for para_name in inspect.getargspec(method)[0]:
-            # create a parameter object if the parameter is not ignorable
-            if para_name not in self.handler.ignore_parameter:
-                para_config = MethodParameterConfig(para_name)
-                self.para.append(para_config)
-            else:
-                self.omit_para.append(para_name)
 
         # parse the description of the function
         doc = inspect.getdoc(method)
@@ -282,25 +237,25 @@ class HandlerMethodConfig(object):
                     line = re.sub('\n$', '', line)
 
                 # If the line defines an argument variable
-                if argRE.search(line):
-                    m = argRE.search(line)
-                    for para_config in self.para:
-                        # match the definition of a parameter and a parameter object with their names
-                        if para_config.name.lower() == m.group('argName').strip().lower():
-                            # update the parameter config
-                            para_config.fromString(line, self)
-
-                # If the line comments the function
-                else:
+                try:
+                    self.para.append(MethodParameterConfig.fromString(line))
+                except ValueError:
+                    # If the line comments the function
                     self.comment += line + "\n"
+                except SyntaxError as e:
+                    raise SyntaxError("Error parsing parameter description in method {!r}: {}".format(self.name, e))
+
         self.comment = self.comment.strip()
 
-        # remove the parameter that has no definition
-        argToRemove = []
-        for para_config in self.para:
-            if para_config.desc == "":
-                argToRemove.append(para_config)
-        map(self.para.remove, argToRemove)
+        # check what Python thinks are the parameters of the method
+        para_names = set(inspect.getargspec(method)[0])
+
+        # make sure we have a description for every non-ignored parameter
+        for n in para_names - self.handler.ignore_parameters:
+            try:
+                self.getParaByName(n)
+            except ValueError:
+                raise SyntaxError("Parameter {!r} of method {!r} is missing definition in method comment.".format(n, self.name))
 
 class HandlerConfig(object):
     """
@@ -310,11 +265,10 @@ class HandlerConfig(object):
         self.name = name                # name of the handler
         self.h_type = h_type            # type of the handler e.g. motionControl or drive
         self.methods = methods          # list of method objects in this handler
-        # To avoid recursive setting
         if self.methods is None:
             self.methods = []
         self.robot_type = robot_type    # type of the robot using this handler for robot specific handlers
-        self.ignore_parameter = ['self', 'initial', 'executor', 'shared_data', 'actuatorVal']
+        self.ignore_parameters = set(['self', 'initial', 'executor', 'shared_data', 'actuatorVal'])
                                         # list of name of parameter that should be ignored where parse the handler methods
 
     def __repr__(self):
@@ -438,7 +392,11 @@ class HandlerConfig(object):
             # only parse the __init__ method if required
             if ((not onlyLoadInit and (not str(method_name).startswith('_')) or str(method_name)=='__init__') ):
                 method_config = HandlerMethodConfig(name=method_name)
-                method_config.fromMethod(method, self)
+                try:
+                    method_config.fromMethod(method, self)
+                except SyntaxError as e:
+                    raise ht.LoadingError("Error while inspecting method {!r} of handler {!r}: {}".format(method_name, handler_module_path, e))
+
                 # add this method into the method list of the handler
                 self.methods.append(method_config)
 
@@ -450,11 +408,10 @@ class RobotConfig(object):
         self.name = r_name              # name of the robot
         self.r_type = r_type            # type of the robot
         self.handlers = handlers        # dictionary of handler object for this robot
-        # To avoid recursive setting
         if self.handlers is None:
             self.handlers = {}
         self.calibration_matrix = None  # 3x3 matrix for converting coordinates, stored as lab->map
-        self.successfully_loaded = ""   # a string either empty or " (Not successfully loaded)"
+        self.successfully_loaded = True
 
     def __repr__(self):
         """
@@ -521,14 +478,12 @@ class RobotConfig(object):
 
         return coordmap_map2lab, coordmap_lab2map
 
-    def _setSuccess(self, success = False):
+    def _setLoadFailureFlag(self):
         """
-        Set whether if this robot is successfully loaded or not
+        Set that this robot has not been successfully loaded
         """
-        if success:
-            self.successfully_loaded = ""
-        else:
-            self.successfully_loaded = " (Not successfully loaded)"
+
+        self.successfully_loaded = False
 
     def fromFile(self, file_path, hsub = None):
         """
@@ -542,142 +497,156 @@ class RobotConfig(object):
             robot_data = fileMethods.readFromFile(file_path)
         except IOError:
             ht.LoadingError("Cannot load the information")
-            self._setSuccess()
+            self._setLoadFailureFlag()
         else:
             # now load the robot config from the dictionary data
             self.fromData(robot_data, hsub)
 
-    def fromData(self, robot_data, hsub = None):
+    def _getCalibrationMatrixFromString(self, calib_mat_str):
+        calib_mat_str = calib_mat_str.strip()
+
+        # Convert the string into an array. Using `literal_eval` instead of
+        # `eval` just so people can't put arbitrary code into the config
+        # file and trick us into a running it.
+        calib_mat_str = calib_mat_str.replace("array(", "")
+        calib_mat_str = calib_mat_str.replace("matrix(", "")
+        calib_mat_str = calib_mat_str.replace(")", "")
+
+        # If empty or undefined, just return an identity matrix
+        if calib_mat_str == "None" or calib_mat_str == "":
+            return eye(3)
+
+        try:
+           return array(ast.literal_eval(calib_mat_str))
+        except SyntaxError:
+            self._setLoadFailureFlag()
+            raise ht.LoadingError("Invalid calibration data found for robot {0}({1})".format(self.name, self.r_type))
+
+    def fromData(self, robot_data, hsub):
         """
         Given a dictionary of robot handler information, returns a robot object holding all the information
         The dictionary is in the format returned by the readFromFile function
         If the necessary handler of the robot is not specified or can't be loaded, return None
         """
-        # make sure we have an instance of handlerSubsystem
-        if hsub is None:
-            raise TypeError("Need an instance of handlerSubsystem to parse robot data")
 
         # update robot name and type
         try:
             self.name = robot_data['RobotName'][0]
         except (KeyError, IndexError):
             raise ht.LoadingError("Cannot find robot name")
-            self._setSuccess()
+            self._setLoadFailureFlag()
 
         try:
             self.r_type = robot_data['Type'][0]
         except (KeyError, IndexError):
             raise ht.LoadingError("Cannot find robot type")
-            self._setSuccess()
+            self._setLoadFailureFlag()
 
         # update robot calibration matrix
-        try:
-            mat_str = ''.join(robot_data['CalibrationMatrix'])
-            if mat_str.strip() == "": raise KeyError()
-        except KeyError:
-            # Some robot does not have calibration matrix
-            pass
-        else:
-            try:
-                # Convert the string form array to array. Trying not to use eval for security problem
-                mat_str = mat_str.replace("array(", "")
-                mat_str = mat_str.replace(")", "")
-                self.calibration_matrix = array(ast.literal_eval(mat_str))
-                if mat_str == "None" or mat_str == "": self.calibration_matrix = array([[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]])
-            except SyntaxError:
-                raise ht.LoadingError("Invalid calibration data found for robot {0}({1})".format(self.name, self.r_type))
-                self._setSuccess()
+        if 'CalibrationMatrix' in robot_data:
+            self.calibration_matrix = self._getCalibrationMatrixFromString(''.join(robot_data['CalibrationMatrix']))
 
         # load handler configs
         for key, val in robot_data.iteritems():
-            if key.endswith('Handler'):
-                # find which type of the handler
+            # Ignore config sections that aren't for handlers
+            if not key.endswith('Handler'):
+                continue
+
+            # Find the intended type of the handler
+            try:
+                handler_type = ht.getHandlerTypeClass(key)
+            except KeyError:
+                logging.warning('Cannot recognize handler type {!r} for robot {}({})'.format(key, self.name, self.r_type))
+                self._setLoadFailureFlag()
+                continue
+
+            # Go through the handler listings for this type
+            for handler_config_str in val:
+                # Parse this line
                 try:
-                    handler_type = ht.getHandlerTypeClass(key)
-                except KeyError:
-                    logging.warning('Cannot recognize handler type {!r} for robot {}({})'.format(key, self.name, self.r_type))
-                    self._setSuccess()
+                    call_descriptors, _ = parseCallString(handler_config_str, mode="single")
+                except SyntaxError:
+                    # This is an invalid handler config description
+                    logging.exception('Cannot recognize handler config description: \n \t {!r} \n \
+                                    for handler type {!r} of robot {}({})'.format(handler_config_str, key, self.name, self.r_type))
+                    self._setLoadFailureFlag()
                     continue
 
-                # use regex to help us parse the string
-                handler_re = re.compile(r"(?P<robot>\w+)\.((?P<h_type>\w+)\.)?(?P<h_name>\w+)\((?P<args>[^\)]*)\)")
+                # Figure out how to interpret the different parts of the CallDescriptor name
+                if len(call_descriptors[0].name) == 3:
+                    robot_type, h_type, handler_name = call_descriptors[0].name
+                    # 3-part name is only valid for shared handlers
+                    if robot_type != 'share':
+                        raise SyntaxError("Name must be in form of 'share.<handler_type>.<handler_name>' or '<robot_type>.<handler_name>'")
+                elif len(call_descriptors[0].name) == 2:
+                    robot_type, handler_name = call_descriptors[0].name
+                    h_type = None
+                else:
+                    raise SyntaxError("Name must be in form of 'share.<handler_type>.<handler_name>' or '<robot_type>.<handler_name>'")
 
-                for handler_config_str in val:
-                    result = handler_re.match(handler_config_str)
-                    if result:
-                        # this is a valid handler config description
+                # Check that this handler belongs to this robot (it's kind of redundant that the `robot_type` must be
+                # specified if we're only going to let it be one value...)
+                if (robot_type != 'share') and (robot_type.lower() != self.r_type.lower()):
+                    # this is a handler for a wrong robot
+                    logging.warning('The handler config description: \n \t {!r} \n \
+                                    is for robot {}, but is located in data for robot {}({})' \
+                                    .format(handler_config_str, robot_type, self.name, self.r_type))
+                    self._setLoadFailureFlag()
+                    continue
 
-                        # since the robot part of the handler description can be either a robot type or name
-                        # set the robot type of the handler to be this robot type if the robot name matches
-                        robot_type = self.r_type if result.group('robot') == self.name else result.group('robot')
-                        if (robot_type != 'share') and (robot_type.lower() != self.r_type.lower()):
-                            # this is a handler for a wrong robot
-                            logging.warning('The handler config description: \n \t {!r} \n \
-                                            is for robot {}, but is located in data for robot {}({})' \
-                                            .format(handler_config_str, robot_type, self.name, self.r_type))
-                            continue
-
-                        # if the description also specifies the handler type in it
-                        # we need to make sure it matches with the handler type we get from section name
-                        if result.group('h_type'):
-                            # get the handler type as class object
-                            try:
-                                handler_type_from_str = ht.getHandlerTypeClass(result.group('h_type'))
-                            except KeyError:
-                                logging.warning('Cannot recognize handler type {!r} in config description: \n \t {!r} \n \
-                                                for robot {}({})'.format(result.group('h_type'), handler_config_str, self.name, self.r_type))
-                                self._setSuccess()
-                                continue
-                            if handler_type_from_str != handler_type:
-                                # the handler type from the description does not match the one from section name
-                                logging.warning('Misplaced handler description: \n \t {!r} \n \
-                                                in handler type {!r} for robot {}({})' \
-                                                .format(result.group(handler_config_str, handler_type, self.name, self.r_type)))
-                                # we still want to put this handler config into the right type
-                                handler_type = handler_type_from_str
-                        elif robot_type == 'share':
-                            # This is a shared handler but no handler type information is given
-                            logging.warning('Handler type info missing for {!r} handler in config description: \n \t {!r} \n \
-                                            for robot {}({})'.format(robot_type, handler_config_str, self.name, self.r_type))
-                            self._setSuccess()
-                            continue
-
-                        handler_name = result.group('h_name')
-                        # now let's get the handler config object based on the info we have got
-
-                        handler_config = hsub.getHandlerConfigDefault(robot_type, handler_type, handler_name)
-
-                        # if it is successfully fetched, we save it at the corresponding handler type of this robot
-                        if handler_config is None:
-                            self._setSuccess()
-                            continue
-
-                        # TODO: is it necessary to check if self.handlers is a dict
-                        if not isinstance(self.handlers, dict): self.handlers = {}
-
-                        # load all parameter values and overwrite the ones in the __init__ method of default handler config object
-                        try:
-                            init_method_config = handler_config.getMethodByName('__init__')
-                        except ValueError:
-                            logging.warning('Cannot update default parameters of default handler config {!r}'.format(handler_config.name))
-                        else:
-                            init_method_config.updateParaFromString(result.group('args'))
-
-                        # save it into the dictionary
-                        if handler_type not in self.handlers.keys():
-                            # This type of handler has not been loaded yet
-                            self.handlers[handler_type] = handler_config
-                        else:
-                            # This type of handler has been loaded, for now, we will NOT overwrite it with new entry
-                            # A warning will be shown
-                            logging.warning('Multiple handler configs are detected for handler type {!r} of robot {}({}). \
-                                    Will only load the first one.'.format(key, self.name, self.r_type))
-                            break
-                    else:
-                        logging.warning('Cannot recognize handler config description: \n \t {!r} \n \
-                                        for handler type {!r} of robot {}({})'.format(handler_config_str, key, self.name, self.r_type))
-                        self._setSuccess()
+                # if the description also specifies the handler type in it
+                # we need to make sure it matches with the handler type we get from section name
+                if h_type is not None:
+                    # get the handler type as class object
+                    try:
+                        handler_type_from_str = ht.getHandlerTypeClass(h_type)
+                    except KeyError:
+                        logging.warning('Cannot recognize handler type {!r} in config description: \n \t {!r} \n \
+                                        for robot {}({})'.format(h_type, handler_config_str, self.name, self.r_type))
+                        self._setLoadFailureFlag()
                         continue
+
+                    if handler_type_from_str != handler_type:
+                        # the handler type from the description does not match the one from section name
+                        logging.warning('Misplaced handler description: \n \t {!r} \n \
+                                        in handler type {!r} for robot {}({})' \
+                                        .format(handler_config_str, handler_type, self.name, self.r_type))
+                        # we still want to put this handler config into the right type
+                        handler_type = handler_type_from_str
+
+                if robot_type == 'share' and h_type is None:
+                    # This is a shared handler but no handler type information is given
+                    logging.warning('Handler type info missing for {!r} handler in config description: \n \t {!r} \n \
+                                    for robot {}({})'.format(robot_type, handler_config_str, self.name, self.r_type))
+                    self._setLoadFailureFlag()
+                    continue
+
+                # now let's get the handler config object based on the info we have got
+                handler_config = hsub.getHandlerConfigDefault(robot_type, handler_type, handler_name)
+
+                # make sure it successfully loaded
+                if handler_config is None:
+                    self._setLoadFailureFlag()
+                    continue
+
+                # load all parameter values and overwrite the ones in the __init__ method of default handler config object
+                try:
+                    init_method_config = handler_config.getMethodByName('__init__')
+                except ValueError:
+                    logging.warning('Cannot update default parameters of default handler config {!r}'.format(handler_config.name))
+                else:
+                    init_method_config.updateParaFromDict(call_descriptors[0].args)
+
+                # if it is successfully fetched, we save it at the corresponding handler type of this robot
+                if handler_type not in self.handlers:
+                    # This type of handler has not been loaded yet
+                    self.handlers[handler_type] = handler_config
+                else:
+                    # This type of handler has been loaded, for now, we will NOT overwrite it with new entry
+                    # A warning will be shown
+                    logging.warning('Multiple handler configs are detected for handler type {!r} of robot {}({}). \
+                            Will only load the first one.'.format(key, self.name, self.r_type))
+                    break
 
 class ExperimentConfig(object):
     """
@@ -692,10 +661,9 @@ class ExperimentConfig(object):
         self.region_tags = region_tags      # dictionary mapping tag names to region groups, for quantification
         self.file_name = file_name          # full path filename of the config
 
-        # To avoid recursive setting
         if self.robots is None:
             self.robots = []
-        # To avoid recursive setting
+
         if self.initial_truths is None:
             self.initial_truths = []
 
@@ -730,12 +698,26 @@ class ExperimentConfig(object):
             reprString = "\n".join(strRepr)
         return "Config Object -- \n" + reprString + "\n"
 
-    def getRobotByName(self,  name):
+    def getRobotByName(self, name):
         for r in self.robots:
             if r.name == name:
                 return r
         logging.error("Could not find robot of name '{0}' in config '{1}'.".format(name, self.name))
         return None
+
+    def normalizePropMapping(self, default_prop_mapping):
+        """
+        Clean up the proposition mapping of this experiment config based on given default mapping
+
+        If the proposition mapping is not set, fill it up with default one
+        If the proposition is not in the default one, delete the mapping
+        """
+        mapping = deepcopy(default_prop_mapping)
+        for p, func in mapping.iteritems():
+            if p in self.prop_mapping:
+                mapping[p] = self.prop_mapping[p]
+
+        self.prop_mapping = mapping
 
     def fromFile(self, file_path, hsub = None):
         """
